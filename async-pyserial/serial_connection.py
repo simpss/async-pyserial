@@ -1,10 +1,10 @@
 from queue import Queue
 import serial
 import threading
+import time
 
 
 class SerialConnection(threading.Thread):
-
     def __init__(self, port, speed, packet_read_callback, ack_string=None):
         # thread
         threading.Thread.__init__(self)
@@ -16,15 +16,17 @@ class SerialConnection(threading.Thread):
         self._port = port
         self._speed = speed
         self._timeout = 1
-        self._encoding = 'utf-8'
+        self.encoding = 'utf-8'
 
         # queues
         self._write_queue = Queue()
+        self._last_write_time = 0.0
+        self.write_rate = 0.2
         self._read_queue = Queue()
 
         # ack
         self._ack_string = ack_string
-        self._ack_timeout = 10
+        self.ack_timeout = 10
 
         self._open()
 
@@ -33,13 +35,13 @@ class SerialConnection(threading.Thread):
         Runs the main serial loop to Read and Write until stop() is called.
         """
         while True and not self._stop_event.is_set():
-            if not self._serial.isOpen():
+            if not self._serial or not self._serial.isOpen():
                 self._open()
 
             self._read_loop()
             self._write_loop()
-        if not self._read_queue.empty():
-            self._packet_read_callback(self._read_queue)
+            if not self._read_queue.empty():
+                self._packet_read_callback(self._read_queue)
 
         print("stop() has been called, stopping Serial Thread")
         self._serial.close()
@@ -56,10 +58,12 @@ class SerialConnection(threading.Thread):
 
     def _write_loop(self):
         """
-        Checks the self._write_queue for new items and writes any to the serial port.
+        Checks the self._write_queue for new items and writes any to the serial port if serial port is writable
+        and self.write_rate < time_since_last_write.
         if self._ack_string is defined waits for an ACK response.
         """
-        if not self._write_queue.empty():
+        time_since_last_write = time.time() - self._last_write_time
+        if not self._write_queue.empty() and self._serial.writable() and time_since_last_write > self.write_rate:
             packet = self._write_queue.get()
             self._write_serial(packet)
             self._wait_ack(packet)
@@ -70,14 +74,20 @@ class SerialConnection(threading.Thread):
         Converts the given packet to bytes and writes them to the serial port.
         :param packet: packet to write
         """
-        self._serial.write(bytes(packet + '\n', self._encoding))
+        if isinstance(packet, bytearray):
+            packet_bytes = bytes(packet)
+        else:
+            packet_bytes = bytes(packet, self.encoding)
+        self._serial.write(packet_bytes)
+        self._last_write_time = time.time()
 
     def _read_loop(self):
         """
-        Checks if there are any new packets coming from the serial port. If any are found adds them to the self._read_queue
+        Checks if there are any new packets coming from the serial port.
+        If any are found adds them to the self._read_queue
         """
-        if self._serial.inWaiting():
-            packet = self._serial.readline(self._serial.inWaiting())
+        if self._serial.in_waiting > 0:
+            packet = self._serial.read(self._serial.in_waiting)
             if len(packet) > 1:
                 self._read_queue.put(packet)
 
@@ -90,12 +100,12 @@ class SerialConnection(threading.Thread):
         if not self._ack_string:
             return
 
-        while self._serial.isOpen() and not self._stop_event.is_set() and timeout < self._ack_timeout:
+        while self._serial.isOpen() and not self._stop_event.is_set() and timeout < self.ack_timeout:
             timeout += 1
             print('waiting for ACK')
             packet = self._serial.readline()
             if len(packet) > 1:
-                if packet == bytes(self._ack_string, self._encoding):
+                if packet == bytes(self._ack_string, self.encoding):
                     return
                 else:
                     self._read_queue.put(packet)
@@ -117,3 +127,4 @@ class SerialConnection(threading.Thread):
             self._serial.flush()
         except Exception as e:
             print("Serial Connection Open Failed: ", e)
+            raise e
